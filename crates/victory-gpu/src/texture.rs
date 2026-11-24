@@ -1304,6 +1304,10 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         return 0;
     }
     if !by_query() {
+        use windows_sys::Win32::System::ProcessStatus::{
+            K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
         static BY_PAGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *BY_PAGE.get_or_init(|| std::env::var_os("VICTORY_MAPPED_BY_PAGE").is_some_and(|v| v == "1")) {
             // By page, without the walk: whole pages, cut to the range.
@@ -1319,14 +1323,40 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         // textures "uploaded in part" kept the pass over the heap's views at
         // 90-160 ms a frame (run 81). `VICTORY_MAPPED_BY_PAGE=1`: by page.
         const BLOCK: usize = 64 << 10;
+        const KERNEL_PAGE: usize = 4096;
+        let last_byte = start.saturating_add(len - 1);
+        let (first, last) = (start / BLOCK, last_byte / BLOCK);
+        // SAFETY: plain data.
+        let mut info: [PSAPI_WORKING_SET_EX_INFORMATION; 256] = unsafe { std::mem::zeroed() };
         let mut there = 0u64;
-        let mut block = start & !(BLOCK - 1);
-        while block < end {
-            let (lo, hi) = (block.max(start), block.saturating_add(BLOCK).min(end));
-            if readable(lo, 1, true).0 == 1 {
-                there += (hi - lo) as u64;
+        let mut block = first;
+        while block <= last {
+            let n = (last - block + 1).min(info.len());
+            for (i, entry) in info[..n].iter_mut().enumerate() {
+                let lo = ((block + i) * BLOCK).max(start);
+                entry.VirtualAddress = (lo & !(KERNEL_PAGE - 1)) as *mut _;
             }
-            block = block.saturating_add(BLOCK);
+            // SAFETY: `n` entries of the size given; our own process.
+            let asked = unsafe {
+                K32QueryWorkingSetEx(
+                    GetCurrentProcess(),
+                    info.as_mut_ptr().cast(),
+                    (n * size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32,
+                )
+            } != 0;
+            for (i, entry) in info[..n].iter().enumerate() {
+                let base = (block + i) * BLOCK;
+                let lo = base.max(start);
+                let hi = base.saturating_add(BLOCK).min(end);
+                let probe = (lo & !(KERNEL_PAGE - 1)) as *const u8;
+                // SAFETY: plain data the query filled in.
+                let valid = asked && unsafe { entry.VirtualAttributes.Flags } & 1 != 0;
+                let mut byte = [0u8];
+                if valid || crate::host::read_into(probe, &mut byte) {
+                    there += (hi - lo) as u64;
+                }
+            }
+            block += n;
         }
         return there;
     }
@@ -1465,6 +1495,39 @@ mod title_memory_tests {
                 assert!(bytes[0x5_0000..HEAD].iter().all(|&b| b == 0x5a));
                 assert!(bytes[HEAD..].iter().all(|&b| b == 0));
             });
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
+
+    #[test]
+    fn mapped_bytes_counts_sparse_blocks_across_batches() {
+        use windows_sys::Win32::System::Memory::*;
+        const BLOCK: usize = 64 << 10;
+        const BLOCKS: usize = 270;
+        // SAFETY: our own reservation; committed blocks are freed below.
+        unsafe {
+            let base =
+                VirtualAlloc(std::ptr::null(), BLOCKS * BLOCK, MEM_RESERVE, PAGE_NOACCESS)
+                    .cast::<u8>();
+            assert!(!base.is_null());
+            assert_eq!(super::mapped_bytes(base, BLOCKS * BLOCK), 0);
+
+            for idx in [0, 130, 265] {
+                let ptr = base.add(idx * BLOCK);
+                assert_eq!(
+                    VirtualAlloc(ptr.cast(), BLOCK, MEM_COMMIT, PAGE_READWRITE),
+                    ptr.cast()
+                );
+                if idx == 130 {
+                    ptr.write(1);
+                }
+            }
+            let skip = 123usize;
+            let cut = 500usize;
+            assert_eq!(
+                super::mapped_bytes(base.add(skip), BLOCKS * BLOCK - skip - cut),
+                (3 * BLOCK - skip) as u64
+            );
             assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
         }
     }
